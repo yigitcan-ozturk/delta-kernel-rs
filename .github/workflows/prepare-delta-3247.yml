@@ -1,0 +1,120 @@
+name: Prepare Delta 3247
+
+on:
+  push:
+    branches:
+      - work/prepare-delta-3247
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out contribution branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/nested-column-mapping-id-3247
+          fetch-depth: 0
+
+      - name: Apply scoped fix and regression test
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('kernel/src/table_features/column_mapping.rs')
+          text = path.read_text()
+
+          replacements = [
+              (
+                  '''                *max_id += 1;\n                nested_ids.insert(element_path.clone(), serde_json::Value::from(*max_id));''',
+                  '''                let element_id = next_column_mapping_id(max_id)?;\n                nested_ids.insert(element_path.clone(), serde_json::Value::from(element_id));''',
+              ),
+              (
+                  '''                *max_id += 1;\n                nested_ids.insert(key_path.clone(), serde_json::Value::from(*max_id));''',
+                  '''                let key_id = next_column_mapping_id(max_id)?;\n                nested_ids.insert(key_path.clone(), serde_json::Value::from(key_id));''',
+              ),
+              (
+                  '''                *max_id += 1;\n                nested_ids.insert(value_path.clone(), serde_json::Value::from(*max_id));''',
+                  '''                let value_id = next_column_mapping_id(max_id)?;\n                nested_ids.insert(value_path.clone(), serde_json::Value::from(value_id));''',
+              ),
+          ]
+
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one match for replacement, found {count}')
+              text = text.replace(old, new, 1)
+
+          marker = '''    #[test]\n    fn test_assign_column_mapping_metadata_nested_struct() {'''
+          if text.count(marker) != 1:
+              raise SystemExit('nested-struct test marker is not unique')
+
+          test = r'''    #[rstest::rstest]
+    #[case::protocol_max(
+        MAX_COLUMN_MAPPING_ID,
+        "exceeds the Delta protocol's 32-bit non-negative maximum"
+    )]
+    #[case::i64_max(i64::MAX, "overflows `i64`")]
+    fn test_assign_nested_column_mapping_ids_use_checked_allocator(
+        #[case] starting_max_id: i64,
+        #[case] expected_error: &str,
+    ) {
+        let array_field = StructField::not_null(
+            "array",
+            DataType::from(ArrayType::new(DataType::INTEGER, true)),
+        )
+        .add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("array-physical".to_string()),
+            ),
+        ]);
+        let schema = schema! {
+            (array_field),
+        };
+
+        let mut max_id = starting_max_id;
+        let err = assign_column_mapping_metadata(&schema, &mut max_id, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Cannot allocate column mapping id") && err.contains(expected_error),
+            "Expected nested-id allocation error containing '{expected_error}', got: {err}",
+        );
+        assert_eq!(max_id, starting_max_id);
+    }
+
+'''
+          text = text.replace(marker, test + marker, 1)
+          path.write_text(text)
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Run focused tests
+        run: |
+          cargo test -p delta_kernel --lib test_assign_nested_column_mapping_ids_use_checked_allocator -- --nocapture
+          cargo test -p delta_kernel --lib test_assign_column_mapping_metadata_errors_when_allocation_would_exceed_protocol_max -- --nocapture
+
+      - name: Verify diff
+        run: |
+          git diff --check
+          git status --short
+          git diff -- kernel/src/table_features/column_mapping.rs
+
+      - name: Commit contribution
+        shell: bash
+        run: |
+          git config user.name "yigitcan-ozturk"
+          git config user.email "318303091+yigitcan-ozturk@users.noreply.github.com"
+          git add kernel/src/table_features/column_mapping.rs
+          git commit -s -m "fix: use checked allocator for nested column mapping ids"
+          git push origin HEAD:fix/nested-column-mapping-id-3247
